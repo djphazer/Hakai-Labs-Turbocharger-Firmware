@@ -69,7 +69,7 @@ See [HARDWARE.md](HARDWARE.md) for wiring and fuse details.
 
 ## Repository contents
 
-- `Turbocharger_Firmware_Official.ino` - the firmware.
+- `Hakai-Labs-Turbocharger-Firmware.ino` - the firmware.
 - `HARDWARE.md` - chip, pinout, and flashing reference.
 - `README.md` - this file.
 
