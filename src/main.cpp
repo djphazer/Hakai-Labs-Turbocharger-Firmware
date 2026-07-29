@@ -46,7 +46,6 @@ volatile uint16_t precomputed_rpm_division = 32;
 uint16_t gate_trigger_counter = 0;
 float previous_det_value = 0.0;
 float current_det_value_within_type = 0.0f;
-float current_position = 0.0f;
 long det_random_number = 0;
 long det_glitch_duration = 0;
 
@@ -305,7 +304,7 @@ void process_turbo_cycle(void) {
     return;
   }
 
-  current_position = (float)turbo_cycle_count / (float)last_total_cycle_count;
+  int current_position = 100 * turbo_cycle_count / last_total_cycle_count;
 
   ///////////////////////////////////////////////////////////////////////////////////
   // DETONATION TYPES 1-5
@@ -327,7 +326,7 @@ void process_turbo_cycle(void) {
     // a turbo pulse (ISR) arrived while position was inside the [0.5, 0.75] window
     // the flag was left TRUE and the output locked high for the entire next cycle.
     detonation_clock_mult_status = (detonation_clock_cycle_reset_counter % det_divisor == 0)
-      && (current_position >= 0.50f && current_position <= 0.75f);
+      && (current_position >= 50 && current_position <= 75);
 
     ///////////////////////////////////////////////////////////////////////////////////
     // DETONATION TYPE 6 - APC (Atari Punk Console) Mode
