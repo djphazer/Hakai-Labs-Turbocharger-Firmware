@@ -68,7 +68,6 @@ uint16_t det_buffer[ADC_SAMPLES];
 float rpm_value = 0;
 float afr_value = 0;
 float det_value = 0;
-float rng_value = 0;
 
 float prev_rpm_value = 0.0;
 float prev_afr_value = 0.0;
@@ -178,15 +177,8 @@ float update_detonation_pot_value(void) {
   return 1;
 }
 
-float update_rng_value(void) {
-  float adc_value = hw::adc_read(ADC_MUXPOS_AIN6_gc);
-  if (adc_value > 1.0) {
-    adc_value = 1.0;
-  } else if (adc_value < 0.01) {
-    adc_value = 0.01;
-  }
-  rng_value = 1.0f - adc_value;
-  return 1;
+uint16_t read_rng(void) {
+  return hw::adc_read(ADC_MUXPOS_AIN6_gc);
 }
 
 
@@ -515,8 +507,7 @@ void process_turbo_cycle(void) {
               // t256: left-shift avoids multiply; signed divide reuses __divmodsi4 already linked.
               // Lerp uses float multiply reusing __mulsf3/__floatsisf/__fixsfsi already linked.
               uint16_t t256 = (uint16_t)(((long)elapsed_us << 8) / (long)glitch_duration_us);
-              long sweep_freq = (long)det_frequency
-                + (long)((float)(det_freq_end - det_frequency) * ((float)t256 / 256.0f));
+              long sweep_freq = (long)det_frequency + (long)((float)(det_freq_end - det_frequency) * ((float)t256 / 256.0f));
               if (sweep_freq < 1L) sweep_freq = 1L;
               delay_us = 500000L / sweep_freq;
               if (delay_us > 65535L) delay_us = 65535L;
@@ -633,15 +624,15 @@ int main(void) {
           uint16_t current_period = TCA0.SINGLE.PER;
 
           // Calculate the proportion of the current cycle that has elapsed
-          float cycle_position = (float)current_count / current_period;
-
           // Calculate the new counter value to maintain the phase
-          uint16_t new_count = (uint16_t)(cycle_position * period);
+          /* TODO: unused?
+          uint16_t new_count = period * current_count / current_period;
 
           // Ensure the counter value is within the valid range
           if (new_count >= period) {
             new_count = period - 1; // Reset to 0 if it exceeds the period
           }
+          */
 
           TCA0.SINGLE.PERBUF = period;
 
