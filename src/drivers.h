@@ -1,4 +1,8 @@
 // core hw abstractions
+
+// Pin defs
+
+// driver functions
 namespace hw {
   void init_ports(void) {
     // Configre my inputs for the module
@@ -24,27 +28,37 @@ namespace hw {
     PORTB.DIRSET = PIN2_bm; // System Status Out LED.  Used for debugging and system info.
 
     // Initial disable of detonation pins just in case something gets stuck
-    PORTB.OUT &= ~PIN0_bm; // Disable Detonation Output just in case
-    PORTA.OUT &= ~PIN7_bm; // Disable Detonation LED just in case
+    PORTB.OUTCLR = PIN0_bm; // Disable Detonation Output just in case
+    PORTA.OUTCLR = PIN7_bm; // Disable Detonation LED just in case
 
     // Enable Pin Change Interrupts
     PORTB.PIN3CTRL = PORT_ISC_RISING_gc; //enable pin interrupts for rising edge for Turbo In. PORT_ISC_RISING_gc or PORT_ISC_BOTHEDGES_gc
     PORTA.PIN5CTRL = PORT_ISC_RISING_gc; //enable pin interrupts for rising edge for Turbo In. PORT_ISC_RISING_gc or PORT_ISC_BOTHEDGES_gc
   }
 
+  inline void set_det_out(const bool on) {
+    if (on) {
+      PORTA.OUTSET = PIN7_bm; // LED
+      PORTB.OUTSET = PIN0_bm; // Injection output
+    } else {
+      PORTA.OUTCLR = PIN7_bm;
+      PORTB.OUTCLR = PIN0_bm;
+    }
+  }
+
   void blink_version_led(void) {
     // Major Version Blink
     for (int i = 0; i < MAJOR_VERSION_NUMBER; i++) {
-      PORTB.OUT |= PIN2_bm;
+      PORTB.OUTSET = PIN2_bm;
       _delay_ms(STATUS_MAJOR_VERSION_BLINK_DELAY);
-      PORTB.OUT &= ~PIN2_bm;
+      PORTB.OUTCLR = PIN2_bm;
       _delay_ms(STATUS_MAJOR_VERSION_BLINK_DELAY);
     }
     // Minor Version Blink
     for (int i = 0; i < MINOR_VERSION_NUMBER; i++) {
-      PORTB.OUT |= PIN2_bm;
+      PORTB.OUTSET = PIN2_bm;
       _delay_ms(STATUS_MINOR_VERSION_BLINK_DELAY);
-      PORTB.OUT &= ~PIN2_bm;
+      PORTB.OUTCLR = PIN2_bm;
       _delay_ms(STATUS_MINOR_VERSION_BLINK_DELAY);
     }
   }
@@ -69,5 +83,15 @@ namespace hw {
     sei(); // Enable global interrupts
     blink_version_led();
     adc_init();
+
+    // --- Reset and initialize PWM timer
+    TCA0.SINGLE.CTRLA = 0;
+    TCA0.SINGLE.CNT = 0;
+    TCA0.SINGLE.PER = 0xffff; // max period
+    TCA0.SINGLE.CMP1 = 0;
+
+    TCA0.SINGLE.CTRLB = TCA_SINGLE_WGMODE_SINGLESLOPE_gc | TCA_SINGLE_CMP1EN_bm;
+    // I was experimenting with the 1024 prescaler here, but decided to use 64.
+    TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV64_gc | TCA_SINGLE_ENABLE_bm; // Set prescaler value to 64
   }
 }

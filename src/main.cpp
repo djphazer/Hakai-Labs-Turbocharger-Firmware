@@ -41,10 +41,10 @@ volatile long cycle_index = 0; // Index for the circular buffer
 volatile uint32_t last_total_cycle_count = 1; // Average of the last cycles (initialized to 1)
 volatile bool detonation_clock_mult_status = false;
 volatile long detonation_clock_cycle_reset_counter = 1;
-static uint16_t gate_trigger_counter = 0;
-float previous_det_value = 0.0;
+volatile uint16_t precomputed_rpm_division = 32;
 
-bool detonation_armed = false;
+uint16_t gate_trigger_counter = 0;
+float previous_det_value = 0.0;
 float current_det_value_within_type = 0.0f;
 float current_position = 0.0f;
 long det_random_number = 0;
@@ -52,13 +52,13 @@ long det_glitch_duration = 0;
 
 
 //RPM Division Variables — pre-computed in main loop, read by ISR
-volatile uint16_t precomputed_rpm_division = 32;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Global System State
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 uint16_t gate_division_value = 8;
 bool gate_last_value = true;
+bool detonation_armed = false;
 
 uint8_t rpm_index = 0;
 uint8_t afr_index = 0;
@@ -190,25 +190,6 @@ float update_rng_value(void) {
   return 1;
 }
 
-void init_rpm_pwm(void) {
-  update_internal_rpm_pot_value();
-  update_afr_pot_value();
-  float frequency = get_frequency_from_rpm_value(rpm_value);
-  uint32_t period = get_period_from_frequency(frequency);
-  prev_rpm_value = rpm_value;
-  prev_afr_value = afr_value;
-
-  // Reset the timer
-  TCA0.SINGLE.CTRLA = 0;
-  TCA0.SINGLE.CNT = 0;
-  TCA0.SINGLE.PER = period;
-  TCA0.SINGLE.CMP1 = (uint32_t)(afr_value * period);
-
-  TCA0.SINGLE.CTRLB = TCA_SINGLE_WGMODE_SINGLESLOPE_gc | TCA_SINGLE_CMP1EN_bm;
-  // I was experimenting with the 1024 prescaler here, but decided to use 64.
-  TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV64_gc | TCA_SINGLE_ENABLE_bm; // Set prescaler value to 64
-}
-
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Interrupt Functions
@@ -286,14 +267,6 @@ void custom_delay_us(uint16_t us) {
   }
 }
 
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Detonation Functions
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-void disarm_detonation(void) {
-  PORTA.OUT &= ~PIN7_bm;
-  PORTB.OUT &= ~PIN0_bm;
-}
-
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Detonation Notes
@@ -327,7 +300,7 @@ void process_turbo_cycle(void) {
     detonation_armed = true;
   } else {
     detonation_armed = false;
-    disarm_detonation();
+    hw::set_det_out(false);
     turbo_cycle_count = turbo_cycle_count + 1;
     return;
   }
@@ -517,11 +490,9 @@ void process_turbo_cycle(void) {
         while (elapsed_us < glitch_duration_us) {
 
           // --- Normal pulse output (one high/low half-cycle pair) ---
-          PORTB.OUTSET = PIN0_bm;
-          PORTA.OUT |= PIN7_bm;
+          hw::set_det_out(true);
           custom_delay_us((uint16_t)delay_us);
-          PORTB.OUTCLR = PIN0_bm;
-          PORTA.OUT &= ~PIN7_bm;
+          hw::set_det_out(false);
           custom_delay_us((uint16_t)delay_us);
 
           elapsed_us += (uint32_t)(2UL * (uint32_t)delay_us);
@@ -611,13 +582,7 @@ void process_turbo_cycle(void) {
     } // end else (gap not active)
   }
 
-  if (detonation_clock_mult_status && detonation_armed) {
-    PORTA.OUT |= PIN7_bm;
-    PORTB.OUT |= PIN0_bm;
-  } else {
-    PORTA.OUT &= ~PIN7_bm;
-    PORTB.OUT &= ~PIN0_bm;
-  }
+  hw::set_det_out(detonation_clock_mult_status && detonation_armed);
   turbo_cycle_count++;
   previous_det_value = det_value;
 }
@@ -629,12 +594,9 @@ int main(void) {
   _PROTECTED_WRITE(CLKCTRL_MCLKCTRLB, 0); // Use the 20 MHz clock
 
   hw::init();
-  init_rpm_pwm();
 
   while (1) {
 
-    //update_internal_rpm_pot_value();
-    //update_afr_pot_value();
     process_turbo_cycle();
 
     // Update the period buffer with the new period.
@@ -648,7 +610,7 @@ int main(void) {
         //DISABLE TIMER as the period is set to 0
         TCA0.SINGLE.CTRLA &= ~TCA_SINGLE_ENABLE_bm;
         // Set port A pin 7 to low
-        PORTA.OUT &= ~PIN7_bm;
+        PORTA.OUTCLR = PIN7_bm; // clear Detonate LED
       } else if (afr_value == 1) {
         //DISABLE TIMER as the period is set to 1
         TCA0.SINGLE.CTRLA &= ~TCA_SINGLE_ENABLE_bm;
