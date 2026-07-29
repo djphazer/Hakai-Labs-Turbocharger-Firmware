@@ -78,6 +78,24 @@ namespace hw {
     return ADC0.RES;
   }
 
+  // 10-bit ADC reading, smoothed
+  // templated so there are separate static buffers for each channel
+  template <uint8_t pin>
+  uint16_t adc_read_avg() {
+    // O(1) running sum: subtract outgoing sample, add incoming sample.
+    // Max sum = 1023 * 20 = 20460, well within uint32_t.
+    static uint16_t buffer[ADC_SAMPLES];
+    static uint32_t running_sum = 0;
+    static uint8_t index = 0;
+
+    running_sum -= buffer[index];
+    buffer[index] = adc_read(pin);
+    running_sum += buffer[index];
+    index = (index + 1) % ADC_SAMPLES;
+
+    return (float)(running_sum / ADC_SAMPLES) / 1023.0f;
+  }
+
   void init(void) {
     init_ports();
     sei(); // Enable global interrupts

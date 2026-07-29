@@ -59,12 +59,6 @@ uint16_t gate_division_value = 8;
 bool gate_last_value = true;
 bool detonation_armed = false;
 
-uint8_t rpm_index = 0;
-uint8_t afr_index = 0;
-uint8_t det_index = 0;
-uint16_t rpm_buffer[ADC_SAMPLES];
-uint16_t afr_buffer[ADC_SAMPLES];
-uint16_t det_buffer[ADC_SAMPLES];
 float rpm_value = 0;
 float afr_value = 0;
 float det_value = 0;
@@ -76,14 +70,14 @@ float prev_detonation_value = 0.0;
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Calculation Utility Functions
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-constexpr float get_frequency_from_rpm_value(float rpm_value) {
+constexpr float get_frequency_from_rpm_value(float rpm) {
   // 1V/octave exponential scaling: frequency = base_freq * 2^(octaves)
-  // rpm_value is normalized ADC (0-1), which maps to CV voltage range -5V to +5V
-  // CV_volts = (rpm_value * 10.0) - 5.0
+  // rpm is normalized ADC (0-1), which maps to CV voltage range -5V to +5V
+  // CV_volts = (rpm * 10.0) - 5.0
   // Frequency doubles for each volt increase (1V/octave)
-  // At CV = -5V (rpm_value = 0): frequency = 4.0875 * 2^0 = 4.0875 Hz
-  // At CV = +5V (rpm_value = 1): frequency = 4.0875 * 2^10 = 4185.6 Hz
-  float cv_volts = (rpm_value * 10.0f) - 5.0f;
+  // At CV = -5V (rpm = 0): frequency = 4.0875 * 2^0 = 4.0875 Hz
+  // At CV = +5V (rpm = 1): frequency = 4.0875 * 2^10 = 4185.6 Hz
+  float cv_volts = (rpm * 10.0f) - 5.0f;
   return MIN_INTERNAL_RPM_FREQ_HZ * powf(2.0f, cv_volts + 5.0f);
 }
 
@@ -111,15 +105,7 @@ constexpr uint32_t get_period_from_frequency(float frequency) {
 /////////////////////////
 // TODO: convert to fixed-point? or do something completely different...
 float update_internal_rpm_pot_value(void) {
-  // O(1) running sum: subtract outgoing sample, add incoming sample.
-  // Max sum = 1023 * 20 = 20460, well within uint32_t.
-  static uint32_t running_sum = 0;
-  running_sum -= rpm_buffer[rpm_index];
-  rpm_buffer[rpm_index] = hw::adc_read(ADC_MUXPOS_AIN1_gc);
-  running_sum += rpm_buffer[rpm_index];
-  rpm_index = (rpm_index + 1) % ADC_SAMPLES;
-
-  float adc_value = (float)(running_sum / ADC_SAMPLES) / 1023.0f;
+  float adc_value = hw::adc_read_avg<ADC_MUXPOS_AIN1_gc>();
   if (adc_value > 1.0f) adc_value = 1.0f;
   if (adc_value < 0.0f) adc_value = 0.0f;
 
@@ -137,13 +123,7 @@ float update_internal_rpm_pot_value(void) {
 }
 
 float update_afr_pot_value(void) {
-  static uint32_t running_sum = 0;
-  running_sum -= afr_buffer[afr_index];
-  afr_buffer[afr_index] = hw::adc_read(ADC_MUXPOS_AIN2_gc);
-  running_sum += afr_buffer[afr_index];
-  afr_index = (afr_index + 1) % ADC_SAMPLES;
-
-  float adc_value = (float)(running_sum / ADC_SAMPLES) / 1023.0f;
+  float adc_value = hw::adc_read_avg<ADC_MUXPOS_AIN2_gc>();
   if (adc_value > 0.9f) {
     adc_value = 1.0f;
   } else if (adc_value < 0.1f) {
@@ -156,13 +136,8 @@ float update_afr_pot_value(void) {
 }
 
 float update_detonation_pot_value(void) {
-  static uint32_t running_sum = 0;
-  running_sum -= det_buffer[det_index];
-  det_buffer[det_index] = hw::adc_read(ADC_MUXPOS_AIN4_gc);
-  running_sum += det_buffer[det_index];
-  det_index = (det_index + 1) % ADC_SAMPLES;
+  float adc_value = hw::adc_read_avg<ADC_MUXPOS_AIN4_gc>();
 
-  float adc_value = (float)(running_sum / ADC_SAMPLES) / 1023.0f;
   if (adc_value > 1.0f) {
     adc_value = 1.0f;
   } else if (adc_value < 0.01f) {
@@ -178,6 +153,7 @@ float update_detonation_pot_value(void) {
 }
 
 uint16_t read_rng(void) {
+  // TODO: figure out how many usable bits of noise we get from this and normalize to a useful range
   return hw::adc_read(ADC_MUXPOS_AIN6_gc);
 }
 
