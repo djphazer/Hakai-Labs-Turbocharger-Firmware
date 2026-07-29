@@ -11,37 +11,28 @@
 #include <math.h>
 //#include <time.h>
 
-#define ADC_SAMPLES 3
-#define DEBOUNCE_CYCLES 50 // Number of cycles to wait for stable reading
-#define CYCLE_AVG_SAMPLES 3 // Number of cycles to average
-#define RPM_LUT_SIZE 256
+static constexpr size_t ADC_SAMPLES = 3;
+static constexpr size_t DEBOUNCE_CYCLES = 50; // Number of cycles to wait for stable reading
+static constexpr size_t CYCLE_AVG_SAMPLES = 3; // Number of cycles to average
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Global Constants - Fine Tuning
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-const int MAJOR_VERSION_NUMBER = 3;
-const int MINOR_VERSION_NUMBER = 1;
-const uint16_t STATUS_MAJOR_VERSION_BLINK_DELAY = 300; // Status LED LED blink delay in ms
-const uint16_t STATUS_MINOR_VERSION_BLINK_DELAY = 100; // Status LED LED blink delay in ms
-const uint16_t MIN_GLITCH_DURATION = 20; // Minimum glitch duration in ms
-const uint16_t MAX_GLITCH_DURATION = 200; // Maximum glitch duration in ms
-const uint16_t MAX_DELAY_BETWEEN_GLITCHES = 600; // Maximum delay between glitches in ms
-const uint16_t MIN_DELAY_BETWEEN_GLITCHES = 1; // Minimum delay between glitches in ms
-const uint16_t GAP_LOOPS_PER_MS = 2; // main-loop iterations per ms; reduce to shorten gap, increase to lengthen it
-const float DET_RESEED_THRESHOLD = 0.05f; // det knob must move this much (0.0-1.0) to advance seed_salt and re-randomize glitches
-const float DET_POT_DEADBAND = 0.05f; // det ADC must change by more than this (0.0-1.0) to update det_value; suppresses hardware noise
-const float MIN_INTERNAL_RPM_FREQ_HZ = 1.5328125; // Minimum Internal RPM Frequency in hz (1V/octave at -5V)
-const float MAX_INTERNAL_RPM_FREQ_HZ = 1569.6; // Maximum Internal RPM Frequency in hz (1V/octave at +5V)
-uint16_t rpm_buffer[ADC_SAMPLES];
-uint16_t afr_buffer[ADC_SAMPLES];
-uint16_t det_buffer[ADC_SAMPLES];
-uint8_t rpm_index = 0;
-uint8_t afr_index = 0;
-uint8_t det_index = 0;
+constexpr int MAJOR_VERSION_NUMBER = 3;
+constexpr int MINOR_VERSION_NUMBER = 1;
+constexpr uint16_t STATUS_MAJOR_VERSION_BLINK_DELAY = 300; // Status LED LED blink delay in ms
+constexpr uint16_t STATUS_MINOR_VERSION_BLINK_DELAY = 100; // Status LED LED blink delay in ms
+constexpr uint16_t MIN_GLITCH_DURATION = 20; // Minimum glitch duration in ms
+constexpr uint16_t MAX_GLITCH_DURATION = 200; // Maximum glitch duration in ms
+constexpr uint16_t MAX_DELAY_BETWEEN_GLITCHES = 600; // Maximum delay between glitches in ms
+constexpr uint16_t MIN_DELAY_BETWEEN_GLITCHES = 1; // Minimum delay between glitches in ms
+constexpr uint16_t GAP_LOOPS_PER_MS = 2; // main-loop iterations per ms; reduce to shorten gap, increase to lengthen it
+constexpr float DET_RESEED_THRESHOLD = 0.05f; // det knob must move this much (0.0-1.0) to advance seed_salt and re-randomize glitches
+constexpr float DET_POT_DEADBAND = 0.05f; // det ADC must change by more than this (0.0-1.0) to update det_value; suppresses hardware noise
+constexpr float MIN_INTERNAL_RPM_FREQ_HZ = 1.5328125; // Minimum Internal RPM Frequency in hz (1V/octave at -5V)
+constexpr float MAX_INTERNAL_RPM_FREQ_HZ = 1569.6; // Maximum Internal RPM Frequency in hz (1V/octave at +5V)
 
-float prev_rpm_value = 0.0;
-float prev_afr_value = 0.0;
-float prev_detonation_value = 0.0;
+#include "drivers.h"
 
 // Variables for Turbo In signal processing (detonation detection)
 volatile long turbo_cycle_count = 0;
@@ -59,77 +50,165 @@ float current_position = 0.0f;
 long det_random_number = 0;
 long det_glitch_duration = 0;
 
-//Gate Division Variables
-uint16_t gate_division_value = 8;
 
 //RPM Division Variables — pre-computed in main loop, read by ISR
 volatile uint16_t precomputed_rpm_division = 32;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Global System Variable Definitions
+// Global System State
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
+uint16_t gate_division_value = 8;
 bool gate_last_value = true;
 
+uint8_t rpm_index = 0;
+uint8_t afr_index = 0;
+uint8_t det_index = 0;
+uint16_t rpm_buffer[ADC_SAMPLES];
+uint16_t afr_buffer[ADC_SAMPLES];
+uint16_t det_buffer[ADC_SAMPLES];
 float rpm_value = 0;
 float afr_value = 0;
 float det_value = 0;
 float rng_value = 0;
 
-// --- Forward Declarations ---
-float get_frequency_from_rpm_value(float rpm_value);
-uint32_t get_period_from_frequency(float frequency);
+float prev_rpm_value = 0.0;
+float prev_afr_value = 0.0;
+float prev_detonation_value = 0.0;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Initialization Functions
+// Calculation Utility Functions
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-void init_ports(void) {
-  // Configre my inputs for the module
-  PORTA.DIRCLR = PIN1_bm; // Potentiometer Turbo Speed Control Input (Internal RPM pot) - 0-5v
-  PORTA.DIRCLR = PIN2_bm; // Potentiometer AFR Input - 0-5v
-  PORTA.DIRCLR = PIN4_bm; // Potentiometer Detonation Input - 0-5v
-  PORTA.DIRCLR = PIN5_bm; // Gate Input 0 or 5v.  Used to send a gate to trigger the output on and off.  When nothing is connected to this input, it will default to 5v and will let the output flow trough constantly.
-  PORTA.DIRCLR = PIN6_bm; // Floating Input for random
-  PORTB.DIRCLR = PIN3_bm; // Turbo In
-
-  // Enable pull-ups for the specified inputs
-  PORTA.PIN1CTRL = PORT_PULLUPEN_bm; // Internal RPM Potentiometer
-  PORTA.PIN2CTRL = PORT_PULLUPEN_bm; // AFR Potentiometer
-  PORTA.PIN4CTRL = PORT_PULLUPEN_bm; // Detonation Potentiometer
-  PORTA.PIN5CTRL = PORT_PULLUPEN_bm; // Gate Input
-  PORTA.PIN6CTRL = ~PORT_PULLUPEN_bm; // DISABLE Pull-up Floating Input for random
-  PORTB.PIN3CTRL = PORT_PULLUPEN_bm; // Turbo In, this may interfere with the signal, so need to test.
-
-  // Configre the outputs for the module
-  PORTA.DIRSET = PIN7_bm; // Detonation Status Out LED
-  PORTB.DIRSET = PIN0_bm; // Detonation Injection Output.  Connected to PortB Pin 1 with a diode.
-  PORTB.DIRSET = PIN1_bm; // Internal RPM Clock Out (PWM on WO1)
-  PORTB.DIRSET = PIN2_bm; // System Status Out LED.  Used for debugging and system info.
-
-  // Initial disable of detonation pins just in case something gets stuck
-  PORTB.OUT &= ~PIN0_bm; // Disable Detonation Output just in case
-  PORTA.OUT &= ~PIN7_bm; // Disable Detonation LED just in case
-
-  // Enable Pin Change Interrupts
-  PORTB.PIN3CTRL = PORT_ISC_RISING_gc; //enable pin interrupts for rising edge for Turbo In. PORT_ISC_RISING_gc or PORT_ISC_BOTHEDGES_gc
-  PORTA.PIN5CTRL = PORT_ISC_RISING_gc; //enable pin interrupts for rising edge for Turbo In. PORT_ISC_RISING_gc or PORT_ISC_BOTHEDGES_gc
+constexpr float get_frequency_from_rpm_value(float rpm_value) {
+  // 1V/octave exponential scaling: frequency = base_freq * 2^(octaves)
+  // rpm_value is normalized ADC (0-1), which maps to CV voltage range -5V to +5V
+  // CV_volts = (rpm_value * 10.0) - 5.0
+  // Frequency doubles for each volt increase (1V/octave)
+  // At CV = -5V (rpm_value = 0): frequency = 4.0875 * 2^0 = 4.0875 Hz
+  // At CV = +5V (rpm_value = 1): frequency = 4.0875 * 2^10 = 4185.6 Hz
+  float cv_volts = (rpm_value * 10.0f) - 5.0f;
+  return MIN_INTERNAL_RPM_FREQ_HZ * powf(2.0f, cv_volts + 5.0f);
 }
 
-void blink_version_led(void) {
-  // Major Version Blink
-  for (int i = 0; i < MAJOR_VERSION_NUMBER; i++) {
-    PORTB.OUT |= PIN2_bm;
-    _delay_ms(STATUS_MAJOR_VERSION_BLINK_DELAY);
-    PORTB.OUT &= ~PIN2_bm;
-    _delay_ms(STATUS_MAJOR_VERSION_BLINK_DELAY);
+constexpr uint32_t get_period_from_frequency(float frequency) {
+  // Prevent division by zero or invalid frequencies
+  if (frequency < 0.01) {
+    frequency = 0.01; // Set a safe minimum frequency
   }
-  // Minor Version Blink
-  for (int i = 0; i < MINOR_VERSION_NUMBER; i++) {
-    PORTB.OUT |= PIN2_bm;
-    _delay_ms(STATUS_MINOR_VERSION_BLINK_DELAY);
-    PORTB.OUT &= ~PIN2_bm;
-    _delay_ms(STATUS_MINOR_VERSION_BLINK_DELAY);
+
+  // Calculate the period based on the CPU clock and prescaler
+  // I was experimenting with the 1024 prescaler here, but decided to use 64.
+  uint32_t period = (uint32_t)(F_CPU / (64.0f * frequency)); // For 64 Prescaler
+
+  // Ensure the period fits within a 16-bit timer
+  if (period > 65535) {
+    period = 65535; // Maximum valid period
+  } else if (period < 1) {
+    period = 1; // Minimum valid period
   }
+  return period;
 }
+
+/////////////////////////
+// Analog read helpers //
+/////////////////////////
+// TODO: convert to fixed-point? or do something completely different...
+float update_internal_rpm_pot_value(void) {
+  // O(1) running sum: subtract outgoing sample, add incoming sample.
+  // Max sum = 1023 * 20 = 20460, well within uint32_t.
+  static uint32_t running_sum = 0;
+  running_sum -= rpm_buffer[rpm_index];
+  rpm_buffer[rpm_index] = hw::adc_read(ADC_MUXPOS_AIN1_gc);
+  running_sum += rpm_buffer[rpm_index];
+  rpm_index = (rpm_index + 1) % ADC_SAMPLES;
+
+  float adc_value = (float)(running_sum / ADC_SAMPLES) / 1023.0f;
+  if (adc_value > 1.0f) adc_value = 1.0f;
+  if (adc_value < 0.0f) adc_value = 0.0f;
+
+  rpm_value = 1.0f - adc_value;
+
+  // Pre-compute RPM division for the ISR so it can avoid powf/logf.
+  // freq_normalized = log2(MIN * 2^(rpm*10) / MIN) / 10 = rpm_value,
+  // so the full 1V/octave frequency normalization reduces to rpm_value itself.
+  int arr_idx = (int)(floorf(rpm_value * 5.0f));
+  if (arr_idx > 5) arr_idx = 5;
+  if (arr_idx < 0) arr_idx = 0;
+  precomputed_rpm_division = (uint16_t)(32u << arr_idx);
+
+  return 1;
+}
+
+float update_afr_pot_value(void) {
+  static uint32_t running_sum = 0;
+  running_sum -= afr_buffer[afr_index];
+  afr_buffer[afr_index] = hw::adc_read(ADC_MUXPOS_AIN2_gc);
+  running_sum += afr_buffer[afr_index];
+  afr_index = (afr_index + 1) % ADC_SAMPLES;
+
+  float adc_value = (float)(running_sum / ADC_SAMPLES) / 1023.0f;
+  if (adc_value > 0.9f) {
+    adc_value = 1.0f;
+  } else if (adc_value < 0.1f) {
+    adc_value = 0.0f;
+  } else {
+    adc_value = (1.25f * adc_value) - 0.125f;
+  }
+  afr_value = 1.0f - adc_value;
+  return 1;
+}
+
+float update_detonation_pot_value(void) {
+  static uint32_t running_sum = 0;
+  running_sum -= det_buffer[det_index];
+  det_buffer[det_index] = hw::adc_read(ADC_MUXPOS_AIN4_gc);
+  running_sum += det_buffer[det_index];
+  det_index = (det_index + 1) % ADC_SAMPLES;
+
+  float adc_value = (float)(running_sum / ADC_SAMPLES) / 1023.0f;
+  if (adc_value > 1.0f) {
+    adc_value = 1.0f;
+  } else if (adc_value < 0.01f) {
+    adc_value = 0.01f;
+  }
+  float new_det = 1.0f - adc_value;
+  // Only update det_value if the reading has moved more than DET_POT_DEADBAND.
+  // This suppresses ADC noise so small hardware drifts do not alter the det state.
+  if (new_det > det_value + DET_POT_DEADBAND || new_det < det_value - DET_POT_DEADBAND) {
+    det_value = new_det;
+  }
+  return 1;
+}
+
+float update_rng_value(void) {
+  float adc_value = hw::adc_read(ADC_MUXPOS_AIN6_gc);
+  if (adc_value > 1.0) {
+    adc_value = 1.0;
+  } else if (adc_value < 0.01) {
+    adc_value = 0.01;
+  }
+  rng_value = 1.0f - adc_value;
+  return 1;
+}
+
+void init_rpm_pwm(void) {
+  update_internal_rpm_pot_value();
+  update_afr_pot_value();
+  float frequency = get_frequency_from_rpm_value(rpm_value);
+  uint32_t period = get_period_from_frequency(frequency);
+  prev_rpm_value = rpm_value;
+  prev_afr_value = afr_value;
+
+  // Reset the timer
+  TCA0.SINGLE.CTRLA = 0;
+  TCA0.SINGLE.CNT = 0;
+  TCA0.SINGLE.PER = period;
+  TCA0.SINGLE.CMP1 = (uint32_t)(afr_value * period);
+
+  TCA0.SINGLE.CTRLB = TCA_SINGLE_WGMODE_SINGLESLOPE_gc | TCA_SINGLE_CMP1EN_bm;
+  // I was experimenting with the 1024 prescaler here, but decided to use 64.
+  TCA0.SINGLE.CTRLA = TCA_SINGLE_CLKSEL_DIV64_gc | TCA_SINGLE_ENABLE_bm; // Set prescaler value to 64
+}
+
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Interrupt Functions
@@ -199,95 +278,6 @@ ISR(PORTA_PORT_vect) {
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Analog Read Functions
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-uint16_t adc_read(uint8_t channel) {
-  ADC0.MUXPOS = channel;
-  ADC0.COMMAND = ADC_STCONV_bm;
-  while (!(ADC0.INTFLAGS & ADC_RESRDY_bm)) { }
-  ADC0.INTFLAGS = ADC_RESRDY_bm;
-  return ADC0.RES;
-}
-
-float update_internal_rpm_pot_value(void) {
-  // O(1) running sum: subtract outgoing sample, add incoming sample.
-  // Max sum = 1023 * 20 = 20460, well within uint32_t.
-  static uint32_t running_sum = 0;
-  running_sum -= rpm_buffer[rpm_index];
-  rpm_buffer[rpm_index] = adc_read(ADC_MUXPOS_AIN1_gc);
-  running_sum += rpm_buffer[rpm_index];
-  rpm_index = (rpm_index + 1) % ADC_SAMPLES;
-
-  float adc_value = (float)(running_sum / ADC_SAMPLES) / 1023.0f;
-  if (adc_value > 1.0f) adc_value = 1.0f;
-  if (adc_value < 0.0f) adc_value = 0.0f;
-
-  rpm_value = 1.0f - adc_value;
-
-  // Pre-compute RPM division for the ISR so it can avoid powf/logf.
-  // freq_normalized = log2(MIN * 2^(rpm*10) / MIN) / 10 = rpm_value,
-  // so the full 1V/octave frequency normalization reduces to rpm_value itself.
-  int arr_idx = (int)(floorf(rpm_value * 5.0f));
-  if (arr_idx > 5) arr_idx = 5;
-  if (arr_idx < 0) arr_idx = 0;
-  precomputed_rpm_division = (uint16_t)(32u << arr_idx);
-
-  return 1;
-}
-
-float update_afr_pot_value(void) {
-  static uint32_t running_sum = 0;
-  running_sum -= afr_buffer[afr_index];
-  afr_buffer[afr_index] = adc_read(ADC_MUXPOS_AIN2_gc);
-  running_sum += afr_buffer[afr_index];
-  afr_index = (afr_index + 1) % ADC_SAMPLES;
-
-  float adc_value = (float)(running_sum / ADC_SAMPLES) / 1023.0f;
-  if (adc_value > 0.9f) {
-    adc_value = 1.0f;
-  } else if (adc_value < 0.1f) {
-    adc_value = 0.0f;
-  } else {
-    adc_value = (1.25f * adc_value) - 0.125f;
-  }
-  afr_value = 1.0f - adc_value;
-  return 1;
-}
-
-float update_detonation_pot_value(void) {
-  static uint32_t running_sum = 0;
-  running_sum -= det_buffer[det_index];
-  det_buffer[det_index] = adc_read(ADC_MUXPOS_AIN4_gc);
-  running_sum += det_buffer[det_index];
-  det_index = (det_index + 1) % ADC_SAMPLES;
-
-  float adc_value = (float)(running_sum / ADC_SAMPLES) / 1023.0f;
-  if (adc_value > 1.0f) {
-    adc_value = 1.0f;
-  } else if (adc_value < 0.01f) {
-    adc_value = 0.01f;
-  }
-  float new_det = 1.0f - adc_value;
-  // Only update det_value if the reading has moved more than DET_POT_DEADBAND.
-  // This suppresses ADC noise so small hardware drifts do not alter the det state.
-  if (new_det > det_value + DET_POT_DEADBAND || new_det < det_value - DET_POT_DEADBAND) {
-    det_value = new_det;
-  }
-  return 1;
-}
-
-float update_rng_value(void) {
-  float adc_value = adc_read(ADC_MUXPOS_AIN6_gc);
-  if (adc_value > 1.0) {
-    adc_value = 1.0;
-  } else if (adc_value < 0.01) {
-    adc_value = 0.01;
-  }
-  rng_value = 1.0f - adc_value;
-  return 1;
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Custom CPU Delay Functions
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 void custom_delay_us(uint16_t us) {
@@ -304,15 +294,6 @@ void disarm_detonation(void) {
   PORTB.OUT &= ~PIN0_bm;
 }
 
-uint8_t get_random_detonation_type(uint16_t seed) {
-  // Seed the random number generator if a seed is provided
-  if (seed != 0) {
-    srand(seed);
-  }
-
-  // Generate a random number between 1 and 4
-  return (rand() % 3) + 1;
-}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Detonation Notes
@@ -642,78 +623,12 @@ void process_turbo_cycle(void) {
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Calculation Utility Functions
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-float get_frequency_from_rpm_value(float rpm_value) {
-  // 1V/octave exponential scaling: frequency = base_freq * 2^(octaves)
-  // rpm_value is normalized ADC (0-1), which maps to CV voltage range -5V to +5V
-  // CV_volts = (rpm_value * 10.0) - 5.0
-  // Frequency doubles for each volt increase (1V/octave)
-  // At CV = -5V (rpm_value = 0): frequency = 4.0875 * 2^0 = 4.0875 Hz
-  // At CV = +5V (rpm_value = 1): frequency = 4.0875 * 2^10 = 4185.6 Hz
-  float cv_volts = (rpm_value * 10.0f) - 5.0f;
-  return MIN_INTERNAL_RPM_FREQ_HZ * powf(2.0f, cv_volts + 5.0f);
-}
-
-uint32_t get_period_from_frequency(float frequency) {
-  // Prevent division by zero or invalid frequencies
-  if (frequency < 0.01) {
-    frequency = 0.01; // Set a safe minimum frequency
-  }
-
-  // Calculate the period based on the CPU clock and prescaler
-  // I was experimenting with the 1024 prescaler here, but decided to use 64.
-  uint32_t period = (uint32_t)(F_CPU / (64.0f * frequency)); // For 64 Prescaler
-
-  // Ensure the period fits within a 16-bit timer
-  if (period > 65535) {
-    period = 65535; // Maximum valid period
-  } else if (period < 1) {
-    period = 1; // Minimum valid period
-  }
-  return period;
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Initialization Functions
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-void init_rpm_pwm(void) {
-  update_internal_rpm_pot_value();
-  update_afr_pot_value();
-  float frequency = get_frequency_from_rpm_value(rpm_value);
-  uint32_t period = get_period_from_frequency(frequency);
-  prev_rpm_value = rpm_value;
-  prev_afr_value = afr_value;
-
-  // Reset the timer
-  TCA0.SINGLE.CTRLA = 0;
-  TCA0.SINGLE.CNT = 0;
-  TCA0.SINGLE.PER = period;
-  TCA0.SINGLE.CMP1 = (uint32_t)(afr_value * period);
-
-  TCA0.SINGLE.CTRLB = TCA_SINGLE_WGMODE_SINGLESLOPE_gc | TCA_SINGLE_CMP1EN_bm;
-  // I was experimenting with the 1024 prescaler here, but decided to use 64.
-  TCA0.SINGLE.CTRLA
-    = TCA_SINGLE_CLKSEL_DIV64_gc | TCA_SINGLE_ENABLE_bm; // Set prescaler value to 64
-}
-
-void adc_init(void) {
-  ADC0.CTRLC = ADC_REFSEL_VDDREF_gc | ADC_PRESC_DIV16_gc; // Slower ADC clock
-  ADC0.CTRLA = ADC_ENABLE_bm;
-  PORTA.PIN1CTRL |= PORT_ISC_INPUT_DISABLE_gc;
-  PORTA.PIN4CTRL |= PORT_ISC_INPUT_DISABLE_gc;
-}
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Main Loop Function
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 int main(void) {
   _PROTECTED_WRITE(CLKCTRL_MCLKCTRLB, 0); // Use the 20 MHz clock
 
-  init_ports();
-  sei(); // Enable global interrupts
-  blink_version_led();
-  adc_init();
+  hw::init();
   init_rpm_pwm();
 
   while (1) {
