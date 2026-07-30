@@ -11,7 +11,7 @@
 #include <math.h>
 //#include <time.h>
 
-static constexpr size_t ADC_SAMPLES = 3;
+static constexpr size_t ADC_SAMPLES = 4;
 static constexpr size_t DEBOUNCE_CYCLES = 50; // Number of cycles to wait for stable reading
 static constexpr size_t CYCLE_AVG_SAMPLES = 3; // Number of cycles to average
 
