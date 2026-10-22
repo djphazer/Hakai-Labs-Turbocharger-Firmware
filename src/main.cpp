@@ -1,37 +1,3 @@
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Global Includes
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-//#include <xc.h>
-#include <avr/io.h>
-#include <avr/interrupt.h>
-#include <util/delay.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <math.h>
-//#include <time.h>
-
-static constexpr size_t ADC_SAMPLES = 4;
-static constexpr size_t DEBOUNCE_CYCLES = 50; // Number of cycles to wait for stable reading
-static constexpr size_t CYCLE_AVG_SAMPLES = 3; // Number of cycles to average
-
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Global Constants - Fine Tuning
-/////////////////////////////////////////////////////////////////////////////////////////////////////////
-constexpr int MAJOR_VERSION_NUMBER = 3;
-constexpr int MINOR_VERSION_NUMBER = 1;
-constexpr uint16_t STATUS_MAJOR_VERSION_BLINK_DELAY = 300; // Status LED LED blink delay in ms
-constexpr uint16_t STATUS_MINOR_VERSION_BLINK_DELAY = 100; // Status LED LED blink delay in ms
-constexpr uint16_t MIN_GLITCH_DURATION = 20; // Minimum glitch duration in ms
-constexpr uint16_t MAX_GLITCH_DURATION = 200; // Maximum glitch duration in ms
-constexpr uint16_t MAX_DELAY_BETWEEN_GLITCHES = 600; // Maximum delay between glitches in ms
-constexpr uint16_t MIN_DELAY_BETWEEN_GLITCHES = 1; // Minimum delay between glitches in ms
-constexpr uint16_t GAP_LOOPS_PER_MS = 2; // main-loop iterations per ms; reduce to shorten gap, increase to lengthen it
-constexpr float DET_RESEED_THRESHOLD = 0.05f; // det knob must move this much (0.0-1.0) to advance seed_salt and re-randomize glitches
-constexpr float DET_POT_DEADBAND = 0.05f; // det ADC must change by more than this (0.0-1.0) to update det_value; suppresses hardware noise
-constexpr float MIN_INTERNAL_RPM_FREQ_HZ = 1.5328125; // Minimum Internal RPM Frequency in hz (1V/octave at -5V)
-constexpr float MAX_INTERNAL_RPM_FREQ_HZ = 1569.6; // Maximum Internal RPM Frequency in hz (1V/octave at +5V)
-
 #include "drivers.h"
 
 // Variables for Turbo In signal processing (detonation detection)
@@ -44,8 +10,7 @@ volatile long detonation_clock_cycle_reset_counter = 1;
 volatile uint16_t precomputed_rpm_division = 32;
 
 uint16_t gate_trigger_counter = 0;
-float previous_det_value = 0.0;
-float current_det_value_within_type = 0.0f;
+uint16_t current_det_value_within_type = 0;
 long det_random_number = 0;
 long det_glitch_duration = 0;
 
@@ -59,29 +24,29 @@ uint16_t gate_division_value = 8;
 bool gate_last_value = true;
 bool detonation_armed = false;
 
-float rpm_value = 0;
-float afr_value = 0;
-float det_value = 0;
+uint16_t rpm_value = 0;
+uint16_t afr_value = 0;
+uint16_t det_value = 0;
 
-float prev_rpm_value = 0.0;
-float prev_afr_value = 0.0;
-float prev_detonation_value = 0.0;
+uint16_t prev_rpm_value = 0;
+uint16_t prev_afr_value = 0;
+uint16_t prev_detonation_value = 0;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Calculation Utility Functions
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-constexpr float get_frequency_from_rpm_value(float rpm) {
+constexpr float get_frequency_from_rpm_value(uint16_t rpm) {
   // 1V/octave exponential scaling: frequency = base_freq * 2^(octaves)
   // rpm is normalized ADC (0-1), which maps to CV voltage range -5V to +5V
   // CV_volts = (rpm * 10.0) - 5.0
   // Frequency doubles for each volt increase (1V/octave)
   // At CV = -5V (rpm = 0): frequency = 4.0875 * 2^0 = 4.0875 Hz
   // At CV = +5V (rpm = 1): frequency = 4.0875 * 2^10 = 4185.6 Hz
-  float cv_volts = (rpm * 10.0f) - 5.0f;
+  float cv_volts = (float(rpm) * 10.0f / ADC_MAX) - 5.0f;
   return MIN_INTERNAL_RPM_FREQ_HZ * powf(2.0f, cv_volts + 5.0f);
 }
 
-constexpr uint32_t get_period_from_frequency(float frequency) {
+constexpr uint32_t get_period_from_frequency(uint16_t frequency) {
   // Prevent division by zero or invalid frequencies
   if (frequency < 0.01) {
     frequency = 0.01; // Set a safe minimum frequency
@@ -104,52 +69,44 @@ constexpr uint32_t get_period_from_frequency(float frequency) {
 // Analog read helpers //
 /////////////////////////
 // TODO: convert to fixed-point? or do something completely different...
-float update_internal_rpm_pot_value(void) {
-  float adc_value = hw::adc_read_avg<ADC_MUXPOS_AIN1_gc>();
-  if (adc_value > 1.0f) adc_value = 1.0f;
-  if (adc_value < 0.0f) adc_value = 0.0f;
+void update_internal_rpm_pot_value(void) {
+  uint16_t adc_value = hw::adc_read_avg<ADC_MUXPOS_AIN1_gc>();
 
-  rpm_value = 1.0f - adc_value;
+  rpm_value = ADC_MAX - adc_value;
 
   // Pre-compute RPM division for the ISR so it can avoid powf/logf.
   // freq_normalized = log2(MIN * 2^(rpm*10) / MIN) / 10 = rpm_value,
   // so the full 1V/octave frequency normalization reduces to rpm_value itself.
-  int arr_idx = (int)(floorf(rpm_value * 5.0f));
+  int arr_idx = (rpm_value * 5) / ADC_MAX;
   if (arr_idx > 5) arr_idx = 5;
   if (arr_idx < 0) arr_idx = 0;
   precomputed_rpm_division = (uint16_t)(32u << arr_idx);
-
-  return 1;
 }
 
-float update_afr_pot_value(void) {
-  float adc_value = hw::adc_read_avg<ADC_MUXPOS_AIN2_gc>();
-  if (adc_value > 0.9f) {
-    adc_value = 1.0f;
-  } else if (adc_value < 0.1f) {
-    adc_value = 0.0f;
+void update_afr_pot_value(void) {
+  uint16_t adc_value = hw::adc_read_avg<ADC_MUXPOS_AIN2_gc>();
+  if (adc_value > 0.9f * ADC_MAX) {
+    adc_value = ADC_MAX;
+  } else if (adc_value < 0.1f * ADC_MAX) {
+    adc_value = 0;
   } else {
-    adc_value = (1.25f * adc_value) - 0.125f;
+    adc_value = (1.25f * adc_value) - 0.125f * ADC_MAX;
   }
-  afr_value = 1.0f - adc_value;
-  return 1;
+  afr_value = ADC_MAX - adc_value;
 }
 
-float update_detonation_pot_value(void) {
-  float adc_value = hw::adc_read_avg<ADC_MUXPOS_AIN4_gc>();
+void update_detonation_pot_value(void) {
+  uint16_t adc_value = hw::adc_read_avg<ADC_MUXPOS_AIN4_gc>();
 
-  if (adc_value > 1.0f) {
-    adc_value = 1.0f;
-  } else if (adc_value < 0.01f) {
-    adc_value = 0.01f;
+  if (adc_value < 0.01f * ADC_MAX) {
+    adc_value = 0.01f * ADC_MAX;
   }
-  float new_det = 1.0f - adc_value;
+  uint16_t new_det = ADC_MAX - adc_value;
   // Only update det_value if the reading has moved more than DET_POT_DEADBAND.
   // This suppresses ADC noise so small hardware drifts do not alter the det state.
   if (new_det > det_value + DET_POT_DEADBAND || new_det < det_value - DET_POT_DEADBAND) {
     det_value = new_det;
   }
-  return 1;
 }
 
 uint16_t read_rng(void) {
@@ -207,7 +164,7 @@ ISR(PORTA_PORT_vect) {
 
   // Every X gates, reset the clock cycle reset counter
   // This affects the detonation logic forcing looping random patterns
-  int gate_array_index = (int)(floor(afr_value * 11));
+  int gate_array_index = (afr_value * 11) / ADC_MAX;
 
   if (gate_array_index == 11) {
     gate_array_index = 10;
@@ -263,7 +220,7 @@ void process_turbo_cycle(void) {
   }
   adc_rr = (adc_rr >= 2) ? 0 : adc_rr + 1;
 
-  if (det_value > 0.075) {
+  if (det_value > 0.075f * ADC_MAX) {
     detonation_armed = true;
   } else {
     detonation_armed = false;
@@ -283,12 +240,12 @@ void process_turbo_cycle(void) {
   //   Type 4 (<=0.5): every 2 cycles
   //   Type 5 (<=0.6): every cycle
   ///////////////////////////////////////////////////////////////////////////////////
-  if (det_value <= 0.6) {
-    uint8_t det_divisor = (det_value <= 0.2) ? 8
-      : (det_value <= 0.3)                   ? 4
-      : (det_value <= 0.4)                   ? 3
-      : (det_value <= 0.5)                   ? 2
-                                             : 1;
+  if (det_value <= 0.6f * ADC_MAX) {
+    uint8_t det_divisor = (det_value <= 0.2f * ADC_MAX) ? 8
+      : (det_value <= 0.3f * ADC_MAX)                   ? 4
+      : (det_value <= 0.4f * ADC_MAX)                   ? 3
+      : (det_value <= 0.5f * ADC_MAX)                   ? 2
+                                                        : 1;
     // Both conditions are evaluated every iteration — no sticky state.
     // Previously the flag was only written inside the counter-match guard, so if
     // a turbo pulse (ISR) arrived while position was inside the [0.5, 0.75] window
@@ -313,8 +270,8 @@ void process_turbo_cycle(void) {
     //   Mid knob (0.4-0.6):           picks 1x through 8x RPM
     //   High knob (0.6-1.0):          picks 1x through 16x RPM
     ///////////////////////////////////////////////////////////////////////////////////
-  } else if (det_value > 0.6 && det_value <= 1.0) {
-    current_det_value_within_type = (det_value - 0.6f) / 0.5f; // 0.0 to 1.0 within Type 6
+  } else if (det_value > 0.6f * ADC_MAX && det_value <= ADC_MAX) {
+    current_det_value_within_type = (det_value - 0.6f * ADC_MAX) * 2; // 0.0 to 1.0 within Type 6
 
     // --- Non-blocking inter-glitch gap ---
     // When det_gap_countdown > 0 the main loop runs freely (pot reads, TCA0 PERBUF
@@ -343,7 +300,7 @@ void process_turbo_cycle(void) {
       static long det_prev_cycle_index = -1;
       if (detonation_clock_cycle_reset_counter == 1 && cycle_index != det_prev_cycle_index) {
         det_prev_cycle_index = cycle_index;
-        int det_trigger_range = (int)(100.0f * ((0.95f - current_det_value_within_type) * 0.8f));
+        int det_trigger_range = (int)(100 * ((0.95f * ADC_MAX - current_det_value_within_type) * 0.8f) / ADC_MAX);
         if (det_trigger_range < 2) det_trigger_range = 2;
         // Minimum N=2: counter%1 is always 0, so N=1 would trigger on every counter
         // value and cause constant blocking. N>=2 keeps glitches musically spaced.
@@ -374,7 +331,7 @@ void process_turbo_cycle(void) {
         }
         srand(
           ((int)((detonation_clock_cycle_reset_counter + gate_trigger_counter)
-                 * ((1.0f - current_det_value_within_type) * 0.8f)))
+                 * ((ADC_MAX - current_det_value_within_type) * 0.8f)))
           ^ seed_salt
         );
 
@@ -383,11 +340,8 @@ void process_turbo_cycle(void) {
 
         // --- Glitch duration: range expands with knob (more chaos at higher positions) ---
         // At knob min: MIN to MAX_GLITCH_DURATION. At knob max: MIN to 1.5x MAX.
-        uint16_t effective_max_glitch = MAX_GLITCH_DURATION
-          + (uint16_t)(current_det_value_within_type * 0.5f * (float)MAX_GLITCH_DURATION);
-        det_glitch_duration = MIN_GLITCH_DURATION
-          + (long)((float)(rand() / (float)RAND_MAX)
-                   * (float)(effective_max_glitch - MIN_GLITCH_DURATION + 1));
+        uint16_t effective_max_glitch = MAX_GLITCH_DURATION + (current_det_value_within_type / 2 * MAX_GLITCH_DURATION) / ADC_MAX;
+        det_glitch_duration = MIN_GLITCH_DURATION + (long)((float)(rand() / (float)RAND_MAX) * (float)(effective_max_glitch - MIN_GLITCH_DURATION + 1));
 
         // --- Harmonic frequency selection biased by knob position ---
         // Harmonics are integer multiples of the current RPM frequency.
@@ -410,6 +364,7 @@ void process_turbo_cycle(void) {
         float current_rpm_freq = get_frequency_from_rpm_value(rpm_value);
         long det_frequency = (long)(current_rpm_freq * (float)selected_harmonic);
         if (det_frequency < 1L) det_frequency = 1L;
+        sizeof(float);
 
         // --- Correct half-period calculation (Bug 2 fix) ---
         // half_period_us = 500,000 / frequency_hz
@@ -470,7 +425,7 @@ void process_turbo_cycle(void) {
             //update_internal_rpm_pot_value();
             //update_afr_pot_value();
 
-            if (det_value < 0.5f || gate_trigger_counter == 1) {
+            if (det_value < ADC_MAX/2 || gate_trigger_counter == 1) {
               // Cancel the Glitch - knob turned down or gate reset
               break;
             }
@@ -520,7 +475,7 @@ void process_turbo_cycle(void) {
 
         TCA0.SINGLE.CTRLA &= ~TCA_SINGLE_ENABLE_bm; // stop
         TCA0.SINGLE.PER = post_glitch_period; // new frequency
-        TCA0.SINGLE.CMP1 = (uint32_t)(afr_value * post_glitch_period); // new duty cycle
+        TCA0.SINGLE.CMP1 = (uint32_t)(afr_value) * post_glitch_period / ADC_MAX; // new duty cycle
         TCA0.SINGLE.CMP1BUF = TCA0.SINGLE.CMP1; // keep buffer consistent
         TCA0.SINGLE.PERBUF = post_glitch_period; // keep buffer consistent
         TCA0.SINGLE.CNT = 0; // start fresh from BOTTOM
@@ -550,7 +505,6 @@ void process_turbo_cycle(void) {
 
   hw::set_det_out(detonation_clock_mult_status && detonation_armed);
   turbo_cycle_count++;
-  previous_det_value = det_value;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -568,8 +522,8 @@ int main(void) {
     // Update the period buffer with the new period.
     // Uses absolute difference — avoids float division and divide-by-zero guards.
     // Threshold 0.001 (~1 ADC LSB on 0-1 scale) keeps the same near-zero behaviour.
-    float rpm_diff = fabsf(rpm_value - prev_rpm_value);
-    float afr_diff = fabsf(afr_value - prev_afr_value);
+    uint16_t rpm_diff = abs(rpm_value - prev_rpm_value);
+    uint16_t afr_diff = abs(afr_value - prev_afr_value);
     if (rpm_diff > 0.001f || afr_diff > 0.001f) {
 
       if (afr_value == 0) {
@@ -577,7 +531,7 @@ int main(void) {
         TCA0.SINGLE.CTRLA &= ~TCA_SINGLE_ENABLE_bm;
         // Set port A pin 7 to low
         PORTA.OUTCLR = PIN7_bm; // clear Detonate LED
-      } else if (afr_value == 1) {
+      } else if (afr_value == ADC_MAX) {
         //DISABLE TIMER as the period is set to 1
         TCA0.SINGLE.CTRLA &= ~TCA_SINGLE_ENABLE_bm;
       } else {
@@ -587,7 +541,7 @@ int main(void) {
         }
 
         if (afr_diff > 0.001f) {
-          TCA0.SINGLE.CMP1BUF = (uint32_t)(afr_value * TCA0.SINGLE.PER);
+          TCA0.SINGLE.CMP1BUF = (uint32_t)(afr_value) * TCA0.SINGLE.PER / ADC_MAX;
         }
 
         if (rpm_diff > 0.001f) {
@@ -615,7 +569,7 @@ int main(void) {
           // Synchronize CMP1 to the new period so the compare always fires.
           // Without this, CMP1 > PER after a rapid low->high sweep, and the
           // output gets stuck HIGH because the compare match never triggers.
-          uint32_t new_cmp1 = (uint32_t)(afr_value * (float)period);
+          uint32_t new_cmp1 = (uint32_t)(afr_value) * period / ADC_MAX;
           if (new_cmp1 >= period) new_cmp1 = period - 1;
           TCA0.SINGLE.CMP1BUF = new_cmp1;
         }

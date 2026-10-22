@@ -1,6 +1,42 @@
-// core hw abstractions
+#pragma once
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Global Includes
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+//#include <xc.h>
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <math.h>
+//#include <time.h>
 
-// Pin defs
+static constexpr size_t ADC_SAMPLES = 4;
+static constexpr size_t ADC_MAX = 0x3ff;
+static constexpr size_t DEBOUNCE_CYCLES = 50; // Number of cycles to wait for stable reading
+static constexpr size_t CYCLE_AVG_SAMPLES = 3; // Number of cycles to average
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Global Constants - Fine Tuning
+/////////////////////////////////////////////////////////////////////////////////////////////////////////
+constexpr int MAJOR_VERSION_NUMBER = 3;
+constexpr int MINOR_VERSION_NUMBER = 1;
+constexpr uint16_t STATUS_MAJOR_VERSION_BLINK_DELAY = 300; // Status LED LED blink delay in ms
+constexpr uint16_t STATUS_MINOR_VERSION_BLINK_DELAY = 100; // Status LED LED blink delay in ms
+constexpr uint16_t MIN_GLITCH_DURATION = 20; // Minimum glitch duration in ms
+constexpr uint16_t MAX_GLITCH_DURATION = 200; // Maximum glitch duration in ms
+constexpr uint16_t MAX_DELAY_BETWEEN_GLITCHES = 600; // Maximum delay between glitches in ms
+constexpr uint16_t MIN_DELAY_BETWEEN_GLITCHES = 1; // Minimum delay between glitches in ms
+constexpr uint16_t GAP_LOOPS_PER_MS = 2; // main-loop iterations per ms; reduce to shorten gap, increase to lengthen it
+constexpr uint16_t DET_RESEED_THRESHOLD = 0.05f * ADC_MAX; // det knob must move this much (0.0-1.0) to advance seed_salt and re-randomize glitches
+constexpr uint16_t DET_POT_DEADBAND = 0.05f * ADC_MAX; // det ADC must change by more than this (0.0-1.0) to update det_value; suppresses hardware noise
+constexpr float MIN_INTERNAL_RPM_FREQ_HZ = 1.5328125; // Minimum Internal RPM Frequency in hz (1V/octave at -5V)
+constexpr float MAX_INTERNAL_RPM_FREQ_HZ = 1569.6; // Maximum Internal RPM Frequency in hz (1V/octave at +5V)
+
+// --- core hw abstractions ---
+
+// TODO: Pin defs?
 
 // driver functions
 namespace hw {
@@ -84,7 +120,7 @@ namespace hw {
   uint16_t adc_read_avg() {
     // O(1) running sum: subtract outgoing sample, add incoming sample.
     // Max sum = 1023 * 20 = 20460, well within uint32_t.
-    static uint16_t buffer[ADC_SAMPLES];
+    static uint16_t buffer[ADC_SAMPLES] = {0};
     static uint32_t running_sum = 0;
     static uint8_t index = 0;
 
@@ -93,7 +129,8 @@ namespace hw {
     running_sum += buffer[index];
     index = (index + 1) % ADC_SAMPLES;
 
-    return (float)(running_sum / ADC_SAMPLES) / 1023.0f;
+    const uint16_t avg = running_sum / ADC_SAMPLES;
+    return (avg & ~0x3ff) ? 1023 : avg; // clipped at 10 bits
   }
 
   void init(void) {
